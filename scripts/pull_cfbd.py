@@ -147,7 +147,7 @@ try:
             try: spent += season_file(name, fn, cached=True)
             except OutOfBudget: raise
             except Exception as e: manifest["errors"][name] = str(e)[:200]; spent += 1
-        for stype, wk in [("regular", w) for w in WEEKS] + [("postseason", 0)]:
+        for stype, wk in [("regular", w) for w in WEEKS] + [("postseason", 1)]:
             if spent >= HISTORY_PER_RUN: break
             try: spent += gamelog_week(y, stype, wk)
             except OutOfBudget: raise
