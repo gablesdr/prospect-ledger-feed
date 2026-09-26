@@ -158,6 +158,16 @@ try:
 except OutOfBudget:
     manifest["errors"]["budget"] = f"Monthly cap of {MONTH_CAP} calls reached; resumes next month."
 
+# ---------- NFL outcomes for the comp engine (nflverse, free; not a CFBD call)
+try:
+    import csv, io
+    txt = requests.get("https://github.com/nflverse/nflverse-data/releases/download/draft_picks/draft_picks.csv", timeout=90).text
+    keep = ["season", "round", "pick", "pfr_player_name", "position", "college", "to", "games", "pass_yards", "rush_yards", "rec_yards", "receptions", "pass_tds", "rush_tds", "rec_tds"]
+    rows = [{k: r.get(k) for k in keep} for r in csv.DictReader(io.StringIO(txt)) if r.get("position") in ("QB", "RB", "WR", "TE") and r.get("season", "0").isdigit() and int(r["season"]) >= 2010]
+    if rows: save("nfl_outcomes.json", rows)
+except Exception as e:
+    manifest["errors"]["nfl_outcomes"] = str(e)[:200]
+
 # progress report
 hist = list(range(SEASON - 1, START_YEAR - 1, -1))
 per_season = 4 + len(WEEKS) + 1
