@@ -6,7 +6,7 @@ Budget: CFBD's free tier is 1,000 calls a month. This script counts every call
 in data/budget.json and stops for the month at MONTH_CAP, so it can never go over.
 
 Priority each night (highest first):
-  1. Current season: player stats, team ratings, schedule, recruits (about 5 calls).
+  1. Current season: player stats, team ratings, schedule, recruits, transfer portal, betting lines (about 7 calls).
   2. Current season game logs: any newly completed week (1 call per week).
   3. The two most recent past seasons, then history back to START_YEAR, newest
      first: season files first (stats, team advanced, schedule, recruits), then
@@ -121,7 +121,9 @@ try:
                      (f"team_advanced_{SEASON}.json", lambda: get("/stats/season/advanced", year=SEASON, excludeGarbageTime="true")),
                      (f"games_{SEASON}.json", lambda: get("/games", year=SEASON, classification="fbs")),
                      (f"sp_ratings_{SEASON}.json", lambda: get("/ratings/sp", year=SEASON)),
-                     (f"recruits_{SEASON}.json", lambda: get("/recruiting/players", year=SEASON, classification="HighSchool"))):
+                     (f"recruits_{SEASON}.json", lambda: get("/recruiting/players", year=SEASON, classification="HighSchool")),
+                     (f"portal_{SEASON}.json", lambda: get("/player/portal", year=SEASON)),
+                     (f"lines_{SEASON}.json", lambda: get("/lines", year=SEASON))):
         try: season_file(name, fn, cached=False)
         except OutOfBudget: raise
         except Exception as e: manifest["errors"][name] = str(e)[:300]
@@ -142,6 +144,7 @@ try:
                 (f"team_advanced_{y}.json", lambda y=y: get("/stats/season/advanced", year=y, excludeGarbageTime="true")),
                 (f"games_{y}.json", lambda y=y: get("/games", year=y, classification="fbs")),
                 (f"recruits_{y}.json", lambda y=y: get("/recruiting/players", year=y, classification="HighSchool"))]
+        if y >= 2021: plan.append((f"portal_{y}.json", lambda y=y: get("/player/portal", year=y)))
         for name, fn in plan:
             if spent >= HISTORY_PER_RUN: break
             try: spent += season_file(name, fn, cached=True)
