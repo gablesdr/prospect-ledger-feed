@@ -1,13 +1,19 @@
-"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v2).
+"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v3).
 
 Writes compact JSON to data/. Claude reads these files on "refresh the ledger".
-- Core files refresh daily (about 6 calls).
-- Game-by-game box scores are pulled by conference and week, so every FBS
-  player is covered without keeping a prospect list. Past seasons backfill a
-  little each night (BACKFILL_BUDGET calls) and are then cached forever.
-  The current season pulls each new week once, and re-pulls the latest two weeks on Sundays and Mondays.
-Free CFBD tier: 1,000 calls a month. This stays well under it.
-One failed call never stops the rest; failures land in data/manifest.json.
+
+Budget: CFBD's free tier is 1,000 calls a month. This script counts every call
+in data/budget.json and stops for the month at MONTH_CAP, so it can never go over.
+
+Priority each night (highest first):
+  1. Current season: player stats, team ratings, schedule, recruits (about 5 calls).
+  2. Current season game logs: any newly completed week (1 call per week).
+  3. The two most recent past seasons, then history back to START_YEAR, newest
+     first: season files first (stats, team advanced, schedule, recruits), then
+     game-by-game logs one week per call. HISTORY_PER_RUN caps this per night.
+Anything already pulled is cached and never pulled again. If CFBD has no data
+for a season or week, that is recorded and skipped. Failures never stop the run;
+they land in data/manifest.json.
 """
 import json, os, sys, time, datetime, requests
 
@@ -18,23 +24,13 @@ BASE = "https://api.collegefootballdata.com"
 H = {"Authorization": f"Bearer {KEY}", "Accept": "application/json"}
 NOW = datetime.datetime.utcnow()
 SEASON = NOW.year if NOW.month >= 8 else NOW.year - 1
-PAST = [SEASON - 1, SEASON - 2]
-CONFS = ["SEC", "B1G", "ACC", "B12", "PAC", "AAC", "MWC", "SBC", "CUSA", "MAC", "Ind"]
-WEEKS = range(1, 17)
-BACKFILL_BUDGET = 40
+START_YEAR = 2000
+MONTH_CAP = 900          # hard stop, leaves 100 calls of headroom under the free 1,000
+HISTORY_PER_RUN = 22     # nightly calls for backfill; about 25 nights to reach 2000
+WEEKS = list(range(1, 17))
 CATS = ("passing", "rushing", "receiving")
 OUT = "data"
 os.makedirs(OUT, exist_ok=True)
-calls = 0
-manifest = {"pulled_at": NOW.isoformat() + "Z", "season": SEASON, "files": {}, "errors": {}}
-
-def get(path, **params):
-    global calls
-    calls += 1
-    r = requests.get(BASE + path, headers=H, params=params, timeout=90)
-    r.raise_for_status()
-    time.sleep(0.6)
-    return r.json()
 
 def load(name, default):
     p = os.path.join(OUT, name)
@@ -45,28 +41,48 @@ def save(name, obj):
         json.dump(obj, f, separators=(",", ":"))
     manifest["files"][name] = len(obj) if isinstance(obj, (list, dict)) else 1
 
-def job(name, fn, cache=False):
-    if cache and os.path.exists(os.path.join(OUT, name)):
-        manifest["files"][name] = "cached"; return
-    try:
-        save(name, fn())
-    except Exception as e:
-        manifest["errors"][name] = str(e)[:300]
+manifest = {"pulled_at": NOW.isoformat() + "Z", "season": SEASON, "files": {}, "errors": {}}
+month = NOW.strftime("%Y-%m")
+budget = load("budget.json", None)
+if budget is None:  # first v3 run: count calls already made this month by v2
+    prev = load("manifest.json", {})
+    seed = prev.get("calls_this_run", 0) if prev.get("pulled_at", "").startswith(month) else 0
+    budget = {"month": month, "calls": seed}
+if budget.get("month") != month:
+    budget = {"month": month, "calls": 0}
+state = load("pull_state.json", {})   # key -> "done" | "empty"
+run_calls = 0
 
-# ---------- core season files
-for y in [SEASON] + PAST:
-    job(f"player_season_{y}.json",
-        lambda y=y: [r for r in get("/stats/player/season", year=y) if r.get("category") in CATS],
-        cache=(y != SEASON))
-    job(f"team_advanced_{y}.json", lambda y=y: get("/stats/season/advanced", year=y, excludeGarbageTime="true"), cache=(y != SEASON))
-    job(f"games_{y}.json", lambda y=y: get("/games", year=y, classification="fbs"), cache=(y != SEASON))
-job(f"sp_ratings_{SEASON}.json", lambda: get("/ratings/sp", year=SEASON))
-for y in range(SEASON - 4, SEASON + 1):
-    job(f"recruits_{y}.json", lambda y=y: get("/recruiting/players", year=y, classification="HighSchool"), cache=(y < SEASON))
+class OutOfBudget(Exception):
+    pass
 
-# ---------- game-by-game box scores
+def get(path, **params):
+    global run_calls
+    if budget["calls"] >= MONTH_CAP:
+        raise OutOfBudget()
+    budget["calls"] += 1; run_calls += 1
+    r = requests.get(BASE + path, headers=H, params=params, timeout=120)
+    r.raise_for_status()
+    time.sleep(0.6)
+    return r.json()
+
+def season_file(name, fn, cached):
+    """Pull a season-level file unless it is cached."""
+    if cached and (state.get(name) in ("done", "empty") or os.path.exists(os.path.join(OUT, name))):
+        return 0
+    rows = fn()
+    if rows:
+        save(name, rows); state[name] = "done"
+    else:
+        state[name] = "empty"
+    return 1
+
+def skill_stats(y):
+    rows = get("/stats/player/season", year=y)
+    return [r for r in rows if r.get("category") in CATS]
+
 def compact(games, y, wk, stype):
-    rows = []
+    out = []
     for g in games:
         teams = g.get("teams", [])
         for t in teams:
@@ -80,68 +96,75 @@ def compact(games, y, wk, stype):
                         ath.setdefault(k, {"n": a.get("name")})[ty.get("name")] = a.get("stat")
             for (aid, cat), st in ath.items():
                 name = st.pop("n")
-                rows.append({"g": g.get("id"), "y": y, "w": wk, "st": stype, "t": t.get("team"), "o": opp,
-                             "ha": t.get("homeAway"), "pid": aid, "n": name, "c": cat, "s": st})
-    return rows
+                out.append({"g": g.get("id"), "y": y, "w": wk, "st": stype, "t": t.get("team"), "o": opp,
+                            "ha": t.get("homeAway"), "pid": aid, "n": name, "c": cat, "s": st})
+    return out
 
-state = load("gamelog_state.json", {})  # "Y|stype|conf|week" -> "done"
-def pull_week(y, stype, conf, wk, force=False):
-    k = f"{y}|{stype}|{conf}|{wk or 0}"
-    if state.get(k) == "done" and not force: return None
-    params = {"year": y, "conference": conf, "seasonType": stype}
+def gamelog_week(y, stype, wk, force=False):
+    """One call covers every FBS game in a week. Rows replace that week in the season file."""
+    k = f"gl|{y}|{stype}|{wk}"
+    if state.get(k) in ("done", "empty") and not force:
+        return 0
+    params = {"year": y, "seasonType": stype}
     if wk: params["week"] = wk
-    games = get("/games/players", **params)
-    state[k] = "done"
-    return compact(games, y, wk or 0, stype)
-
-def merge_rows(y, new_rows, replace_keys):
+    rows = compact(get("/games/players", **params), y, wk, stype)
     name = f"gamelogs_{y}.json"
-    rows = [r for r in load(name, []) if (r["st"], r["w"], r["t"]) not in replace_keys]
-    rows += new_rows
-    save(name, rows)
+    kept = [r for r in load(name, []) if not (r["st"] == stype and r["w"] == wk)]
+    if rows or kept:
+        save(name, kept + rows)
+    state[k] = "done" if rows else "empty"
+    return 1
 
-# current season: re-pull the two most recent completed weeks
 try:
-    sched = load(f"games_{SEASON}.json", [])
-    done_weeks = sorted({g.get("week") for g in sched if g.get("completed")})
-    # re-pull the last two weeks on Sunday and Monday (UTC) to catch stat corrections
-    recent = done_weeks[-2:] if (done_weeks and NOW.weekday() in (6, 0)) else []
-    for wk in done_weeks:  # anything never pulled yet
-        for conf in CONFS:
-            if f"{SEASON}|regular|{conf}|{wk}" not in state and wk not in recent: recent.append(wk)
-    for wk in sorted(set(recent)):
-        batch = []
-        for conf in CONFS:
-            try:
-                rows = pull_week(SEASON, "regular", conf, wk, force=True) or []
-                batch += rows
-            except Exception as e:
-                manifest["errors"][f"gamelog {SEASON} wk{wk} {conf}"] = str(e)[:200]
-        merge_rows(SEASON, batch, {(r["st"], r["w"], r["t"]) for r in batch})
-except Exception as e:
-    manifest["errors"]["gamelog current"] = str(e)[:300]
+    # 1. current season core (daily)
+    for name, fn in ((f"player_season_{SEASON}.json", lambda: skill_stats(SEASON)),
+                     (f"team_advanced_{SEASON}.json", lambda: get("/stats/season/advanced", year=SEASON, excludeGarbageTime="true")),
+                     (f"games_{SEASON}.json", lambda: get("/games", year=SEASON, classification="fbs")),
+                     (f"sp_ratings_{SEASON}.json", lambda: get("/ratings/sp", year=SEASON)),
+                     (f"recruits_{SEASON}.json", lambda: get("/recruiting/players", year=SEASON, classification="HighSchool"))):
+        try: season_file(name, fn, cached=False)
+        except OutOfBudget: raise
+        except Exception as e: manifest["errors"][name] = str(e)[:300]
 
-# past seasons: backfill within budget
-spent = 0
-for y in PAST:
-    batch = []
-    for stype, weeks in (("regular", WEEKS), ("postseason", [None])):
-        for wk in weeks:
-            for conf in CONFS:
-                if spent >= BACKFILL_BUDGET: break
-                k = f"{y}|{stype}|{conf}|{wk or 0}"
-                if state.get(k) == "done": continue
-                try:
-                    rows = pull_week(y, stype, conf, wk)
-                    spent += 1
-                    if rows: batch += rows
-                except Exception as e:
-                    manifest["errors"][f"gamelog {k}"] = str(e)[:200]; spent += 1
-    if batch:
-        merge_rows(y, batch, set())
-save("gamelog_state.json", state)
-total = len(PAST) * (len(WEEKS) + 1) * len(CONFS)
-manifest["backfill"] = {"done": sum(1 for k in state if int(k.split("|")[0]) in PAST), "of": total}
-manifest["calls_this_run"] = calls
+    # 2. current season game logs: new weeks, plus re-pull last two weeks on Sun/Mon (stat corrections)
+    sched = load(f"games_{SEASON}.json", [])
+    done_weeks = sorted({g.get("week") for g in sched if g.get("completed") and g.get("seasonType", "regular") == "regular"})
+    redo = set(done_weeks[-2:]) if NOW.weekday() in (6, 0) else set()
+    for wk in done_weeks:
+        try: gamelog_week(SEASON, "regular", wk, force=(wk in redo))
+        except OutOfBudget: raise
+        except Exception as e: manifest["errors"][f"gamelog {SEASON} wk{wk}"] = str(e)[:200]
+
+    # 3. backfill, newest season first, within the nightly allowance
+    spent = 0
+    for y in range(SEASON - 1, START_YEAR - 1, -1):
+        plan = [(f"player_season_{y}.json", lambda y=y: skill_stats(y)),
+                (f"team_advanced_{y}.json", lambda y=y: get("/stats/season/advanced", year=y, excludeGarbageTime="true")),
+                (f"games_{y}.json", lambda y=y: get("/games", year=y, classification="fbs")),
+                (f"recruits_{y}.json", lambda y=y: get("/recruiting/players", year=y, classification="HighSchool"))]
+        for name, fn in plan:
+            if spent >= HISTORY_PER_RUN: break
+            try: spent += season_file(name, fn, cached=True)
+            except OutOfBudget: raise
+            except Exception as e: manifest["errors"][name] = str(e)[:200]; spent += 1
+        for stype, wk in [("regular", w) for w in WEEKS] + [("postseason", 0)]:
+            if spent >= HISTORY_PER_RUN: break
+            try: spent += gamelog_week(y, stype, wk)
+            except OutOfBudget: raise
+            except Exception as e: manifest["errors"][f"gamelog {y} {stype} {wk}"] = str(e)[:200]; spent += 1
+        if spent >= HISTORY_PER_RUN: break
+except OutOfBudget:
+    manifest["errors"]["budget"] = f"Monthly cap of {MONTH_CAP} calls reached; resumes next month."
+
+# progress report
+hist = list(range(SEASON - 1, START_YEAR - 1, -1))
+per_season = 4 + len(WEEKS) + 1
+done = sum(1 for k in state if not k.startswith("gl|") and any(k.endswith(f"_{y}.json") for y in hist)) + \
+       sum(1 for k in state if k.startswith("gl|") and int(k.split("|")[1]) in hist)
+manifest["backfill"] = {"start_year": START_YEAR, "steps_done": done, "steps_total": len(hist) * per_season,
+                        "empty": sorted(k for k, v in state.items() if v == "empty")[:50]}
+manifest["budget"] = {"month": budget["month"], "calls_used": budget["calls"], "cap": MONTH_CAP, "calls_this_run": run_calls}
+save("pull_state.json", state)
+save("budget.json", budget)
 save("manifest.json", manifest)
 print(json.dumps(manifest, indent=1))
