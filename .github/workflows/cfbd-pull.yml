@@ -1,0 +1,30 @@
+name: Pull CFBD data
+
+on:
+  schedule:
+    - cron: "0 11 * * *"   # every day at 11:00 UTC (5 AM Denver)
+  workflow_dispatch: {}      # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Pull from CollegeFootballData.com
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+        run: python scripts/pull_cfbd.py
+      - name: Save changes
+        run: |
+          git config user.name "ledger-bot"
+          git config user.email "ledger-bot@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || git commit -m "CFBD pull $(date -u +%Y-%m-%d)"
+          git push
