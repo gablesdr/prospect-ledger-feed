@@ -1,4 +1,9 @@
-"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v3).
+"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v4, 2026-09-28).
+
+v4: (a) recruiting classes 2008-current are pulled first, once (one call per class, skill positions only for past
+classes), so the model can test recruiting pedigree before the full backfill reaches them; (b) nfl_seasons.json:
+season-by-season NFL half-PPR points and positional finish (rank among all players at the position that season)
+for every QB/RB/WR/TE drafted 2010+, from nflverse stats_player (free, not a CFBD call).
 
 Writes compact JSON to data/. Claude reads these files on "refresh the ledger".
 
@@ -136,6 +141,18 @@ try:
         except OutOfBudget: raise
         except Exception as e: manifest["errors"][f"gamelog {SEASON} wk{wk}"] = str(e)[:200]
 
+    # 2b. v4: recruiting classes back to 2008, once each (skill positions + athletes for past classes)
+    SKILLPOS = {"PRO", "DUAL", "QB", "RB", "APB", "WR", "TE", "ATH"}
+    for y in range(SEASON - 1, 2007, -1):
+        name = f"recruits_{y}.json"
+        if state.get(name) in ("done", "empty") or os.path.exists(os.path.join(OUT, name)): continue
+        try:
+            rows = [r for r in get("/recruiting/players", year=y, classification="HighSchool") if (r.get("position") or "").upper() in SKILLPOS]
+            if rows: save(name, rows); state[name] = "done"
+            else: state[name] = "empty"
+        except OutOfBudget: raise
+        except Exception as e: manifest["errors"][name] = str(e)[:200]
+
     # 3. backfill, newest season first, within the nightly allowance
     spent = 0
     for y in range(SEASON - 1, START_YEAR - 1, -1):
@@ -167,6 +184,35 @@ try:
     if rows: save("nfl_outcomes.json", rows)
 except Exception as e:
     manifest["errors"]["nfl_outcomes"] = str(e)[:200]
+
+# ---------- v4: NFL season-by-season fantasy finishes (nflverse stats_player, free; not a CFBD call)
+try:
+    dp = {r.get("gsis_id"): r for r in csv.DictReader(io.StringIO(requests.get("https://github.com/nflverse/nflverse-data/releases/download/draft_picks/draft_picks.csv", timeout=90).text))
+          if r.get("gsis_id") and r.get("position") in ("QB", "RB", "WR", "TE") and r.get("season", "0").isdigit() and int(r["season"]) >= 2010}
+    out, miss = [], []
+    for y in range(2010, SEASON):
+        try:
+            t = requests.get(f"https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_reg_{y}.csv", timeout=120)
+            t.raise_for_status()
+        except Exception as e:
+            miss.append(y); continue
+        rows = list(csv.DictReader(io.StringIO(t.text)))
+        pts = []
+        for r in rows:
+            pos = r.get("position") or r.get("position_group")
+            if pos not in ("QB", "RB", "WR", "TE"): continue
+            try: ppr = float(r.get("fantasy_points_ppr") or 0); rec = float(r.get("receptions") or 0); g = int(float(r.get("games") or 0))
+            except ValueError: continue
+            pts.append((pos, r.get("player_id"), ppr - 0.5 * rec, g))
+        for pos in ("QB", "RB", "WR", "TE"):
+            L = sorted([p for p in pts if p[0] == pos], key=lambda p: -p[2])
+            for i, (_, pid, hp, g) in enumerate(L):
+                d = dp.get(pid)
+                if d: out.append([d.get("pfr_player_name"), int(d["season"]), y, pos, g, round(hp, 1), i + 1])
+    if out: save("nfl_seasons.json", {"fields": ["pfr_player_name", "draft_season", "season", "pos", "games", "half_ppr", "pos_finish"], "rows": out})
+    if miss: manifest["errors"]["nfl_seasons"] = "no stats_player_reg file for " + ",".join(map(str, miss))
+except Exception as e:
+    manifest["errors"]["nfl_seasons"] = str(e)[:200]
 
 # ---------- Combine measurables for comps (nflverse, free; not a CFBD call)
 try:
