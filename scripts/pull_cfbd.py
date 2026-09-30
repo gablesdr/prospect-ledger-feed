@@ -1,4 +1,12 @@
-"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v4, 2026-09-28).
+"""Nightly CollegeFootballData.com pull for the Prospect Ledger (v5, 2026-09-30).
+
+v5: advanced player data for scatter charts and model tests, all on the free tier:
+  ppa_players_<Y>.json  (/ppa/players/season: EPA/PPA per play, pass/rush and by down; 2014+)
+  usage_<Y>.json        (/player/usage: share of team plays overall, pass, rush, by down; 2014+)
+  roster_<Y>.json       (/roster: official height, weight, class year, hometown; 2014+)
+  returning_<Y>.json    (/player/returning: team returning production; 2014+)
+Current season: PPA and usage re-pulled Sunday/Monday (after the week's games) and on first run; roster once a week (Monday);
+returning once. History 2014+: ADV_PER_RUN calls a night, newest first, cached like everything else.
 
 v4: (a) recruiting classes 2008-current are pulled first, once (one call per class, skill positions only for past
 classes), so the model can test recruiting pedigree before the full backfill reaches them; (b) nfl_seasons.json:
@@ -32,6 +40,8 @@ SEASON = NOW.year if NOW.month >= 8 else NOW.year - 1
 START_YEAR = 2000
 MONTH_CAP = 900          # hard stop, leaves 100 calls of headroom under the free 1,000
 HISTORY_PER_RUN = 22     # nightly calls for backfill; about 25 nights to reach 2000
+ADV_START = 2014         # v5: advanced player files back to here (matches the PFF history)
+ADV_PER_RUN = 10         # v5: nightly calls for advanced-file history (48 files, about 5 nights)
 WEEKS = list(range(1, 17))
 CATS = ("passing", "rushing", "receiving")
 OUT = "data"
@@ -153,6 +163,29 @@ try:
         except OutOfBudget: raise
         except Exception as e: manifest["errors"][name] = str(e)[:200]
 
+    # 2c. v5: advanced player files (PPA, usage, roster, returning). Current season weekly, history 2014+ capped per night.
+    ADV = lambda y: [(f"ppa_players_{y}.json", lambda y=y: get("/ppa/players/season", year=y, excludeGarbageTime="true")),
+                     (f"usage_{y}.json", lambda y=y: get("/player/usage", year=y, excludeGarbageTime="true")),
+                     (f"roster_{y}.json", lambda y=y: [{k: r.get(k) for k in ("id", "firstName", "lastName", "team", "height", "weight", "jersey", "year", "position", "homeCity", "homeState", "recruitIds")}
+                                                        for r in get("/roster", year=y) if (r.get("position") or "") in ("QB", "RB", "WR", "TE", "FB", "ATH")]),
+                     (f"returning_{y}.json", lambda y=y: get("/player/returning", year=y))]
+    weekly = NOW.weekday() in (6, 0)
+    for name, fn in ADV(SEASON):
+        fresh = (name.startswith("ppa_") or name.startswith("usage_")) and weekly or name.startswith("roster_") and NOW.weekday() == 0
+        try: season_file(name, fn, cached=not fresh)
+        except OutOfBudget: raise
+        except Exception as e: manifest["errors"][name] = str(e)[:300]
+    adv_spent = 0
+    for y in range(SEASON - 1, ADV_START - 1, -1):
+        for name, fn in ADV(y):
+            if adv_spent >= ADV_PER_RUN: break
+            try: adv_spent += season_file(name, fn, cached=True)
+            except OutOfBudget: raise
+            except Exception as e: manifest["errors"][name] = str(e)[:200]; adv_spent += 1
+        if adv_spent >= ADV_PER_RUN: break
+    manifest["advanced"] = {"start_year": ADV_START, "files_done": sum(1 for k, v in state.items() if v in ("done", "empty") and k.startswith(("ppa_", "usage_", "roster_", "returning_"))),
+                            "files_total": 4 * (SEASON - ADV_START + 1)}
+
     # 3. backfill, newest season first, within the nightly allowance
     spent = 0
     for y in range(SEASON - 1, START_YEAR - 1, -1):
@@ -226,7 +259,8 @@ except Exception as e:
 # progress report
 hist = list(range(SEASON - 1, START_YEAR - 1, -1))
 per_season = 4 + len(WEEKS) + 1
-done = sum(1 for k in state if not k.startswith("gl|") and any(k.endswith(f"_{y}.json") for y in hist)) + \
+ADVP = ("ppa_", "usage_", "roster_", "returning_")
+done = sum(1 for k in state if not k.startswith("gl|") and not k.startswith(ADVP) and any(k.endswith(f"_{y}.json") for y in hist)) + \
        sum(1 for k in state if k.startswith("gl|") and int(k.split("|")[1]) in hist)
 manifest["backfill"] = {"start_year": START_YEAR, "steps_done": done, "steps_total": len(hist) * per_season,
                         "empty": sorted(k for k, v in state.items() if v == "empty")[:50]}
